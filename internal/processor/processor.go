@@ -56,7 +56,7 @@ func Handle(
 		logger.Error().Err(err).Str("device_id", data.DeviceID).Msg("Invalid device UUID")
 		return err
 	}
-
+	log.Printf("Device UUID: %s", deviceUUID.String())
 	// Deduplication check
 	dup, err := redisutil.IsDuplicate(ctx, rdb, data.DeviceID, data.Timestamp.Unix())
 	if err != nil {

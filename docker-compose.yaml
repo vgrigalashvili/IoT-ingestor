@@ -4,8 +4,8 @@ services:
   postgres:
     image: postgres:15
     environment:
-      POSTGRES_USER: iotuser
-      POSTGRES_PASSWORD: iotpass
+      POSTGRES_USER: iot-ingestor # Set a custom username
+      POSTGRES_PASSWORD: iot-ingestor-pass # Set a custom password
       POSTGRES_DB: iotdb
     ports:
       - '5432:5432'
@@ -21,7 +21,7 @@ services:
       - '5672:5672'
       - '15672:15672'
     environment:
-      RABBITMQ_DEFAULT_USER: iot-ingestor # Use custom username
+      RABBITMQ_DEFAULT_USER: iot-ingestor # Set a custom username
       RABBITMQ_DEFAULT_PASS: iot-ingestor-pass # Set a custom password
     volumes:
       - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf

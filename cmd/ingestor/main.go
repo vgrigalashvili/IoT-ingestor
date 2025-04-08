@@ -15,8 +15,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 
+	"github.com/vgrigalashvili/IoT-ingestor/internal/db"
 	"github.com/vgrigalashvili/IoT-ingestor/internal/logger"
 	"github.com/vgrigalashvili/IoT-ingestor/internal/mqtt"
+	"github.com/vgrigalashvili/IoT-ingestor/internal/processor"
 	"github.com/vgrigalashvili/IoT-ingestor/internal/rabbitmq"
 	redisutil "github.com/vgrigalashvili/IoT-ingestor/internal/redis"
 )
@@ -48,6 +50,9 @@ func main() {
 	}
 	defer dbPool.Close()
 
+	// Create database queries instance
+	queries := db.New(dbPool)
+
 	// Initialize Redis
 	rdb := redisutil.Init(mustGetEnv("REDIS_ADDR"))
 	defer rdb.Close()
@@ -63,12 +68,18 @@ func main() {
 	}
 	defer rabbitClient.Close()
 
-	// Initialize MQTT with enhanced logging
+	// Initialize MQTT with message processing
 	mqttClient := mqtt.NewClient(
 		mustGetEnv("MQTT_BROKER"),
 		func(topic string, payload []byte) {
-			log.Debug().Str("topic", topic).Msg("Received message")
-			// ... processing ...
+			start := time.Now()
+			err := processor.Handle(ctx, queries, rdb, rabbitClient, payload)
+
+			log.Debug().
+				Str("topic", topic).
+				Dur("duration", time.Since(start)).
+				Err(err).
+				Msg("Message processed")
 		},
 	)
 
@@ -76,12 +87,12 @@ func main() {
 	go func() {
 		retryDelay := time.Second
 		for {
-			log.Info().Str("broker", mqttClient.Broker).Msg("Attempting MQTT connection") // <- Capital B in Broker
+			log.Info().Str("broker", mqttClient.Broker).Msg("Attempting MQTT connection")
 
 			if err := mqttClient.Connect(); err != nil {
 				log.Error().
 					Err(err).
-					Str("broker", mqttClient.Broker). // <- Capital B here
+					Str("broker", mqttClient.Broker).
 					Dur("retry_delay", retryDelay).
 					Msg("MQTT connection failed")
 
@@ -99,6 +110,7 @@ func main() {
 			break
 		}
 	}()
+
 	// Graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
