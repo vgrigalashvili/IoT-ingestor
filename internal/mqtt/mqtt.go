@@ -5,27 +5,64 @@
 package mqtt
 
 import (
+	"time"
+
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 )
 
-// Start connects to an MQTT broker and subscribes to all sensor topics.
-func Start(broker string, onMessage func(topic string, payload []byte)) {
+type Client struct {
+	client  mqtt.Client
+	Broker  string // <- Changed to exported field
+	handler func(string, []byte)
+	opts    *mqtt.ClientOptions
+}
+
+func NewClient(broker string, messageHandler func(string, []byte)) *Client {
 	opts := mqtt.NewClientOptions().
 		AddBroker(broker).
-		SetClientID("iot-ingestor")
+		SetClientID("iot-ingestor-" + uuid.New().String()[:8]).
+		SetAutoReconnect(true).
+		SetConnectRetryInterval(5 * time.Second).
+		SetConnectTimeout(10 * time.Second).
+		SetKeepAlive(30 * time.Second).
+		SetCleanSession(true).
+		SetConnectionLostHandler(func(client mqtt.Client, err error) {
+			log.Error().Err(err).Msg("MQTT connection lost")
+		}).
+		SetOnConnectHandler(func(client mqtt.Client) {
+			log.Info().Msg("MQTT connection established")
+		})
 
-	client := mqtt.NewClient(opts)
-
-	if token := client.Connect(); token.Wait() && token.Error() != nil {
-		log.Fatal().Err(token.Error()).Msg("MQTT connection failed")
+	return &Client{
+		client:  mqtt.NewClient(opts),
+		Broker:  broker, // <- Capitalized field name
+		handler: messageHandler,
+		opts:    opts,
 	}
+}
 
-	if token := client.Subscribe("sensors/+", 1, func(_ mqtt.Client, msg mqtt.Message) {
-		onMessage(msg.Topic(), msg.Payload())
+// Connect establishes the MQTT connection with retry logic
+func (c *Client) Connect() error {
+	if token := c.client.Connect(); token.Wait() && token.Error() != nil {
+		return token.Error()
+	}
+	return nil
+}
+
+// Subscribe starts listening to sensor topics
+func (c *Client) Subscribe() error {
+	if token := c.client.Subscribe("sensors/+", 1, func(_ mqtt.Client, msg mqtt.Message) {
+		c.handler(msg.Topic(), msg.Payload())
 	}); token.Wait() && token.Error() != nil {
-		log.Fatal().Err(token.Error()).Msg("MQTT subscription failed")
+		return token.Error()
 	}
+	return nil
+}
 
-	log.Info().Msg("MQTT connected and subscribed")
+// Disconnect closes the MQTT connection gracefully
+func (c *Client) Disconnect(quiesce uint) {
+	c.client.Disconnect(quiesce)
+	log.Info().Msg("MQTT client disconnected")
 }

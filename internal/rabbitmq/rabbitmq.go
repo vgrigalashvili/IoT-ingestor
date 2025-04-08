@@ -6,35 +6,130 @@ package rabbitmq
 
 import (
 	"encoding/json"
+	"errors"
+	"log"
+	"time"
 
 	"github.com/rabbitmq/amqp091-go"
 )
 
-// Init connects to RabbitMQ and declares the sensor exchange.
-func Init(url string) (*amqp091.Connection, *amqp091.Channel, error) {
-	conn, err := amqp091.Dial(url)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	ch, err := conn.Channel()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	err = ch.ExchangeDeclare("sensor_exchange", "fanout", true, false, false, false, nil)
-	return conn, ch, err
+type RabbitMQClient struct {
+	conn         *amqp091.Connection
+	channel      *amqp091.Channel
+	exchangeName string
+	url          string
 }
 
-// Publish sends telemetry data to the fanout exchange.
-func Publish(ch *amqp091.Channel, exchange string, payload any) error {
-	body, err := json.Marshal(payload)
+// NewClient creates a new persistent RabbitMQ client
+func NewClient(url, exchange string) (*RabbitMQClient, error) {
+	client := &RabbitMQClient{
+		exchangeName: exchange,
+		url:          url,
+	}
+
+	err := client.connect()
+	if err != nil {
+		return nil, err
+	}
+
+	go client.handleReconnect()
+	return client, nil
+}
+
+func (c *RabbitMQClient) connect() error {
+	var err error
+	c.conn, err = amqp091.Dial(c.url)
 	if err != nil {
 		return err
 	}
 
-	return ch.Publish(exchange, "", false, false, amqp091.Publishing{
-		ContentType: "application/json",
-		Body:        body,
-	})
+	c.channel, err = c.conn.Channel()
+	if err != nil {
+		return err
+	}
+
+	return c.channel.ExchangeDeclare(
+		c.exchangeName, // name
+		"fanout",       // type
+		true,           // durable
+		false,          // auto-deleted
+		false,          // internal
+		false,          // no-wait
+		nil,            // arguments
+	)
+}
+
+func (c *RabbitMQClient) handleReconnect() {
+	for {
+		reason := <-c.conn.NotifyClose(make(chan *amqp091.Error))
+		log.Printf("Connection closed: %v", reason)
+
+		// Exponential backoff
+		retryWait := 1 * time.Second
+		for {
+			time.Sleep(retryWait)
+
+			err := c.connect()
+			if err == nil {
+				log.Println("Successfully reconnected")
+				return
+			}
+
+			retryWait *= 2
+			if retryWait > 30*time.Second {
+				retryWait = 30 * time.Second
+			}
+			log.Printf("Failed to reconnect: %v. Retrying in %v", err, retryWait)
+		}
+	}
+}
+
+// Publish safely handles message publishing with retries
+func (c *RabbitMQClient) Publish(payload any) error {
+	const maxRetries = 3
+	var lastErr error
+
+	for i := 0; i < maxRetries; i++ {
+		if c.channel.IsClosed() {
+			if err := c.connect(); err != nil {
+				lastErr = err
+				continue
+			}
+		}
+
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+
+		err = c.channel.Publish(
+			c.exchangeName, // exchange
+			"",             // routing key
+			false,          // mandatory
+			false,          // immediate
+			amqp091.Publishing{
+				ContentType: "application/json",
+				Body:        body,
+				Timestamp:   time.Now(),
+			},
+		)
+
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		time.Sleep(1 * time.Second)
+	}
+
+	return errors.New("failed to publish after retries: " + lastErr.Error())
+}
+
+// Close cleans up resources properly
+func (c *RabbitMQClient) Close() {
+	if c.channel != nil {
+		c.channel.Close()
+	}
+	if c.conn != nil {
+		c.conn.Close()
+	}
 }

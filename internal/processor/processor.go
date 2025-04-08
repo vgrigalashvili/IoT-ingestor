@@ -11,7 +11,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/rabbitmq/amqp091-go"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog/log"
 
@@ -20,7 +19,7 @@ import (
 	redisutil "github.com/vgrigalashvili/IoT-ingestor/internal/redis"
 )
 
-// TelemetryPayload represents normalized sensor data from MQTT.
+// TelemetryPayload represents normalized sensor data from MQTT
 type TelemetryPayload struct {
 	DeviceID    string    `json:"device_id"`
 	Timestamp   time.Time `json:"timestamp"`
@@ -28,30 +27,48 @@ type TelemetryPayload struct {
 	Humidity    float64   `json:"humidity"`
 }
 
-// Handle processes a single MQTT message payload: decode, deduplicate, insert, publish.
-func Handle(ctx context.Context, q *db.Queries, rdb *redis.Client, ch *amqp091.Channel, raw []byte) {
+// Handle processes a single MQTT message payload through the full pipeline
+func Handle(
+	ctx context.Context,
+	q *db.Queries,
+	rdb *redis.Client,
+	rmq *rabbitmq.RabbitMQClient,
+	raw []byte,
+) error {
+	startTime := time.Now()
+	logger := log.With().Str("component", "processor").Logger()
+
+	defer func() {
+		logger.Debug().
+			Dur("duration_ms", time.Since(startTime)).
+			Msg("Processing completed")
+	}()
+
 	var data TelemetryPayload
 	if err := json.Unmarshal(raw, &data); err != nil {
-		log.Error().Err(err).Msg("Failed to parse telemetry")
-		return
+		logger.Error().Err(err).Msg("Failed to parse telemetry payload")
+		return err
 	}
 
+	// Validate device ID
 	deviceUUID, err := uuid.Parse(data.DeviceID)
 	if err != nil {
-		log.Error().Err(err).Msg("Invalid UUID")
-		return
+		logger.Error().Err(err).Str("device_id", data.DeviceID).Msg("Invalid device UUID")
+		return err
 	}
 
+	// Deduplication check
 	dup, err := redisutil.IsDuplicate(ctx, rdb, data.DeviceID, data.Timestamp.Unix())
 	if err != nil {
-		log.Error().Err(err).Msg("Redis error")
-		return
+		logger.Error().Err(err).Msg("Redis deduplication check failed")
+		return err
 	}
 	if dup {
-		log.Info().Str("device", data.DeviceID).Msg("Duplicate payload skipped")
-		return
+		logger.Info().Str("device_id", data.DeviceID).Msg("Duplicate payload skipped")
+		return nil
 	}
 
+	// Database insertion
 	_, err = q.InsertSensorData(ctx, db.InsertSensorDataParams{
 		DeviceID:    toPgUUID(deviceUUID),
 		Timestamp:   toPgTimestamp(data.Timestamp),
@@ -59,38 +76,34 @@ func Handle(ctx context.Context, q *db.Queries, rdb *redis.Client, ch *amqp091.C
 		Humidity:    toPgFloat64(data.Humidity),
 	})
 	if err != nil {
-		log.Error().Err(err).Msg("DB insert failed")
-		return
+		logger.Error().Err(err).Msg("Database insertion failed")
+		return err
 	}
 
-	if err := rabbitmq.Publish(ch, "sensor_exchange", data); err != nil {
-		log.Error().Err(err).Msg("Publish to RabbitMQ failed")
-		return
+	// Publish to RabbitMQ
+	if err := rmq.Publish(data); err != nil {
+		logger.Error().Err(err).Msg("Failed to publish to RabbitMQ")
+		return err
 	}
 
-	log.Info().Str("device", data.DeviceID).Msg("Telemetry processed successfully")
+	logger.Info().
+		Str("device_id", data.DeviceID).
+		Float64("temperature", data.Temperature).
+		Float64("humidity", data.Humidity).
+		Msg("Telemetry processed successfully")
+
+	return nil
 }
 
-// toPgUUID converts uuid.UUID to pgtype.UUID
+// Conversion helpers for PostgreSQL types
 func toPgUUID(u uuid.UUID) pgtype.UUID {
-	return pgtype.UUID{
-		Bytes: u,
-		Valid: true,
-	}
+	return pgtype.UUID{Bytes: u, Valid: true}
 }
 
-// toPgTimestamp converts time.Time to pgtype.Timestamptz
 func toPgTimestamp(t time.Time) pgtype.Timestamptz {
-	return pgtype.Timestamptz{
-		Time:  t,
-		Valid: true,
-	}
+	return pgtype.Timestamptz{Time: t, Valid: true}
 }
 
-// toPgFloat64 converts float64 to pgtype.Float8
 func toPgFloat64(f float64) pgtype.Float8 {
-	return pgtype.Float8{
-		Float64: f,
-		Valid:   true,
-	}
+	return pgtype.Float8{Float64: f, Valid: true}
 }
